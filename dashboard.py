@@ -1,6 +1,7 @@
 """
 Sales Dashboard — Happy Users First
 Focus: active users → adoption → revenue follows.
+Everything is measured in quarters: set goals, achieve them, compare.
 Run: streamlit run dashboard.py --server.port 8503
 """
 import json
@@ -50,7 +51,8 @@ def load_data():
     # Ensure numeric columns
     num_cols = ["active_users", "paying_users", "trend_pct", "billing_interval_days",
                 "q1_2026_avg", "q1_2025_avg", "q4_2025_avg", "yoy_pct", "qoq_pct",
-                "nps", "nps_prev", "nps_delta", "nps_responses"]
+                "nps_q1_26", "nps_q4_25", "nps_q1_25", "nps_yoy", "nps_qoq",
+                "nps_responses_q1_26"]
     for col in num_cols:
         if col in companies.columns:
             companies[col] = pd.to_numeric(companies[col], errors="coerce")
@@ -88,11 +90,30 @@ companies, owners, eng_df, collected_at = load_data()
 sales_owners = sorted(companies["owner_name"].dropna().unique())
 sales_owners = [o for o in sales_owners if o not in ("Unknown", "Unassigned", "")]
 ec_clients = companies[companies["active_users"].notna()].copy()
-nps_clients = companies[companies["nps"].notna()].copy()
+nps_clients = companies[companies["nps_q1_26"].notna()].copy()
 
 # ─── Sidebar ────────────────────────────────────────────────────
 st.sidebar.title("Sales Dashboard")
 st.sidebar.caption(f"Data: {collected_at[:16]}")
+st.sidebar.markdown("---")
+
+# Global quarter comparison
+st.sidebar.markdown("**Quarter**")
+compare_mode = st.sidebar.radio(
+    "Comparison",
+    ["Q1 2026 vs Q1 2025 (YoY)", "Q1 2026 vs Q4 2025 (QoQ)"],
+    label_visibility="collapsed",
+)
+is_yoy = "YoY" in compare_mode
+
+# Derived column names based on comparison mode
+user_prev_col = "q1_2025_avg" if is_yoy else "q4_2025_avg"
+user_trend_col = "yoy_pct" if is_yoy else "qoq_pct"
+nps_cur_col = "nps_q1_26"
+nps_prev_col = "nps_q1_25" if is_yoy else "nps_q4_25"
+nps_delta_col = "nps_yoy" if is_yoy else "nps_qoq"
+prev_label = "Q1 2025" if is_yoy else "Q4 2025"
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Focus:** Happy Users First")
 st.sidebar.markdown(
@@ -115,37 +136,26 @@ tab1, tab2, tab5, tab3, tab4 = st.tabs([
 # ═══════════════════════════════════════════════════════════════
 with tab1:
     st.header("User Health — How are our users doing?")
-    st.caption("Ed Controls accounts with active users data")
+    st.caption(f"Ed Controls accounts · Comparing Q1 2026 vs {prev_label}")
 
     if ec_clients.empty:
         st.warning("No Ed Controls active users data found.")
     else:
-        # ─ Quarter selector ─
-        compare_mode = st.radio(
-            "Comparison", ["Q1 2026 vs Q1 2025 (YoY)", "Q1 2026 vs Q4 2025 (QoQ)"],
-            horizontal=True,
-        )
-        is_yoy = "YoY" in compare_mode
-        trend_col = "yoy_pct" if is_yoy else "qoq_pct"
-        prev_avg_col = "q1_2025_avg" if is_yoy else "q4_2025_avg"
-        prev_label = "Q1 2025" if is_yoy else "Q4 2025"
-
-        has_trend = ec_clients[trend_col].notna()
+        has_trend = ec_clients[user_trend_col].notna()
         ec_with_trend = ec_clients[has_trend].copy()
 
         # ─ Top-level metrics ─
         total_active = int(ec_clients["active_users"].sum())
-        total_paying = int(ec_clients["paying_users"].sum())
-        total_prev = int(ec_with_trend[prev_avg_col].sum()) if not ec_with_trend.empty else 0
+        total_prev = int(ec_with_trend[user_prev_col].sum()) if not ec_with_trend.empty else 0
         total_cur = int(ec_with_trend["q1_2026_avg"].sum()) if not ec_with_trend.empty else 0
-        yoy_total = round((total_cur - total_prev) / total_prev * 100, 1) if total_prev > 0 else 0
-        growing = len(ec_with_trend[ec_with_trend[trend_col] > 5])
-        declining = len(ec_with_trend[ec_with_trend[trend_col] < -5])
+        pct_change = round((total_cur - total_prev) / total_prev * 100, 1) if total_prev > 0 else 0
+        growing = len(ec_with_trend[ec_with_trend[user_trend_col] > 5])
+        declining = len(ec_with_trend[ec_with_trend[user_trend_col] < -5])
         avg_adoption = ec_clients["adoption_pct"].mean()
 
         col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Active Users (Mar '26)", f"{total_active:,}")
-        col2.metric(f"vs {prev_label}", f"{yoy_total:+.1f}%",
+        col1.metric("Active Users (Q1 '26)", f"{total_active:,}")
+        col2.metric(f"vs {prev_label}", f"{pct_change:+.1f}%",
                     delta=f"{total_cur - total_prev:+,} users", delta_color="normal")
         col3.metric("Growing", growing, delta=f"{growing} accounts", delta_color="normal")
         col4.metric("Declining", declining, delta=f"-{declining} accounts", delta_color="inverse")
@@ -172,12 +182,10 @@ with tab1:
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            # Active users per AM
             au_am = ec_clients.groupby("owner_name").agg(
                 active=("active_users", "sum"),
                 paying=("paying_users", "sum"),
                 accounts=("id", "count"),
-                declining=("health", lambda x: (x == "declining").sum()),
             ).reset_index()
             au_am = au_am[au_am["owner_name"].isin(sales_owners)].sort_values("active", ascending=False)
 
@@ -226,16 +234,16 @@ with tab1:
         scorecard = ec_with_trend.groupby("owner_name").agg(
             accounts=("id", "count"),
             active_q1_26=("q1_2026_avg", "sum"),
-            active_prev=( prev_avg_col, "sum"),
+            active_prev=(user_prev_col, "sum"),
             total_paying=("paying_users", "sum"),
-            growing=(trend_col, lambda x: (x > 5).sum()),
-            stable=(trend_col, lambda x: ((x >= -5) & (x <= 5)).sum()),
-            declining=(trend_col, lambda x: (x < -5).sum()),
-            avg_trend=(trend_col, "mean"),
+            growing=(user_trend_col, lambda x: (x > 5).sum()),
+            stable=(user_trend_col, lambda x: ((x >= -5) & (x <= 5)).sum()),
+            declining=(user_trend_col, lambda x: (x < -5).sum()),
+            avg_trend=(user_trend_col, "mean"),
             avg_adoption=("adoption_pct", "mean"),
         ).reset_index()
         scorecard = scorecard[scorecard["owner_name"].isin(sales_owners)]
-        scorecard["yoy_total"] = ((scorecard["active_q1_26"] - scorecard["active_prev"]) / scorecard["active_prev"] * 100).round(1)
+        scorecard["portfolio_pct"] = ((scorecard["active_q1_26"] - scorecard["active_prev"]) / scorecard["active_prev"] * 100).round(1)
         scorecard["health_score"] = (
             scorecard["growing"] * 2 + scorecard["stable"] * 1 - scorecard["declining"] * 2
         ) / scorecard["accounts"] * 100
@@ -243,17 +251,17 @@ with tab1:
 
         disp = scorecard.rename(columns={
             "owner_name": "Account Manager", "accounts": "EdC Accounts",
-            "active_q1_26": "Users Q1'26", "active_prev": f"Users {prev_label}",
+            "active_q1_26": "Users Q1 '26", "active_prev": f"Users {prev_label}",
             "total_paying": "Paying",
             "growing": "Growing", "stable": "Stable", "declining": "Declining",
-            "avg_trend": f"Avg Trend", "yoy_total": f"Portfolio {trend_col.upper()}",
+            "avg_trend": "Avg Trend", "portfolio_pct": f"Portfolio %",
             "avg_adoption": "Adoption %", "health_score": "Health Score",
         })
         disp["Avg Trend"] = disp["Avg Trend"].apply(lambda x: f"{x:+.1f}%")
-        disp[f"Portfolio {trend_col.upper()}"] = disp[f"Portfolio {trend_col.upper()}"].apply(lambda x: f"{x:+.1f}%")
+        disp["Portfolio %"] = disp["Portfolio %"].apply(lambda x: f"{x:+.1f}%")
         disp["Adoption %"] = disp["Adoption %"].apply(lambda x: f"{x:.0f}%")
         disp["Health Score"] = disp["Health Score"].apply(lambda x: f"{x:.0f}")
-        disp["Users Q1'26"] = disp["Users Q1'26"].astype(int)
+        disp["Users Q1 '26"] = disp["Users Q1 '26"].astype(int)
         disp[f"Users {prev_label}"] = disp[f"Users {prev_label}"].astype(int)
         st.dataframe(disp, hide_index=True, use_container_width=True)
 
@@ -274,7 +282,6 @@ with tab2:
             "No Contact",
         ])
 
-        # ─ Alert 1: Declining active users ─
         with alert_tab1:
             st.subheader("Accounts with declining active users")
             threshold_decline = st.slider("Minimum decline %", -50, 0, -10, step=5, key="decline")
@@ -287,7 +294,6 @@ with tab2:
                 col2.metric("Active Users at risk", int(declining["active_users"].sum()))
                 col3.metric("Avg decline", f"{declining['trend_pct'].mean():.0f}%")
 
-                # Per AM
                 am_dec = declining.groupby("owner_name").agg(
                     accounts=("id", "count"),
                     users_at_risk=("active_users", "sum"),
@@ -316,7 +322,6 @@ with tab2:
             else:
                 st.success("No accounts with declining users!")
 
-        # ─ Alert 2: Low adoption (paying/active ratio) ─
         with alert_tab2:
             st.subheader("Low adoption — licenses underutilized")
             st.caption("Accounts where paying/active user ratio is low. Opportunity for training or onboarding.")
@@ -326,7 +331,7 @@ with tab2:
             low_adoption = ec_clients[
                 (ec_clients["adoption_pct"].notna()) &
                 (ec_clients["adoption_pct"] < adoption_threshold) &
-                (ec_clients["active_users"] > 5)  # skip tiny accounts
+                (ec_clients["active_users"] > 5)
             ].sort_values("adoption_pct")
 
             if not low_adoption.empty:
@@ -346,7 +351,6 @@ with tab2:
             else:
                 st.success(f"All accounts above {adoption_threshold}% adoption!")
 
-        # ─ Alert 3: No recent contact on active accounts ─
         with alert_tab3:
             st.subheader("Active clients without recent contact")
             st.caption("Accounts with active users but no HubSpot contact in 60+ days")
@@ -372,33 +376,39 @@ with tab2:
                 detail["Last Contact"] = detail["Last Contact"].dt.strftime("%Y-%m-%d").fillna("-")
                 st.dataframe(detail, hide_index=True, use_container_width=True, height=400)
             else:
-                st.success(f"All active accounts have recent contact!")
+                st.success("All active accounts have recent contact!")
 
 
 # ═══════════════════════════════════════════════════════════════
-# TAB 5: NPS
+# TAB 5: NPS (quarterly)
 # ═══════════════════════════════════════════════════════════════
 with tab5:
     st.header("NPS — Make People Happy")
-    st.caption("Net Promoter Score per client (Ed Controls, last 12 months)")
+    st.caption(f"Net Promoter Score per client · Q1 2026 vs {prev_label}")
 
     if nps_clients.empty:
-        st.warning("No NPS data found. Make sure nps_edc_responses.csv is available and run collect.py.")
+        st.warning("No NPS data found for Q1 2026. Run collect.py with nps_edc_responses.csv.")
     else:
         # Top metrics
-        avg_nps = nps_clients["nps"].mean()
-        median_nps = nps_clients["nps"].median()
-        total_responses = int(nps_clients["nps_responses"].sum())
-        promoters = len(nps_clients[nps_clients["nps"] >= 50])
-        detractors = len(nps_clients[nps_clients["nps"] <= -10])
-        with_delta = nps_clients[nps_clients["nps_delta"].notna()]
-        improving = len(with_delta[with_delta["nps_delta"] > 0]) if not with_delta.empty else 0
-        declining_nps = len(with_delta[with_delta["nps_delta"] < 0]) if not with_delta.empty else 0
+        avg_nps = nps_clients[nps_cur_col].mean()
+        total_responses = int(nps_clients["nps_responses_q1_26"].sum())
+
+        # Clients with comparison data
+        has_prev = nps_clients[nps_prev_col].notna()
+        has_delta = nps_clients[nps_delta_col].notna()
+        improving = len(nps_clients[has_delta & (nps_clients[nps_delta_col] > 0)])
+        declining_nps = len(nps_clients[has_delta & (nps_clients[nps_delta_col] < 0)])
+
+        # Previous quarter avg
+        prev_nps = nps_clients.loc[has_prev, nps_prev_col].mean()
+        nps_change = round(avg_nps - prev_nps, 0) if pd.notna(prev_nps) else None
 
         col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Avg NPS", f"{avg_nps:.0f}")
+        col1.metric("NPS Q1 '26", f"{avg_nps:.0f}",
+                     delta=f"{nps_change:+.0f} vs {prev_label}" if nps_change is not None else None,
+                     delta_color="normal")
         col2.metric("Clients with NPS", len(nps_clients))
-        col3.metric("Responses (12m)", f"{total_responses:,}")
+        col3.metric("Responses Q1 '26", f"{total_responses:,}")
         col4.metric("NPS improving", improving, delta=f"{improving} clients", delta_color="normal")
         col5.metric("NPS declining", declining_nps, delta=f"-{declining_nps} clients", delta_color="inverse")
 
@@ -407,11 +417,10 @@ with tab5:
         col1, col2 = st.columns(2)
 
         with col1:
-            # NPS distribution histogram
             fig = px.histogram(
-                nps_clients, x="nps", nbins=20,
-                title="NPS Distribution per Client",
-                labels={"nps": "NPS Score", "count": "Number of clients"},
+                nps_clients, x=nps_cur_col, nbins=20,
+                title="NPS Distribution Q1 2026",
+                labels={nps_cur_col: "NPS Score", "count": "Number of clients"},
                 color_discrete_sequence=[BLUE],
             )
             fig.add_vline(x=0, line_dash="dash", line_color="grey", annotation_text="Neutral")
@@ -420,17 +429,17 @@ with tab5:
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            # NPS per AM
             nps_am = nps_clients[nps_clients["owner_name"].isin(sales_owners)].groupby("owner_name").agg(
-                avg_nps=("nps", "mean"),
+                avg_nps=(nps_cur_col, "mean"),
+                avg_prev=(nps_prev_col, "mean"),
                 clients=("id", "count"),
-                responses=("nps_responses", "sum"),
+                responses=("nps_responses_q1_26", "sum"),
             ).reset_index().sort_values("avg_nps", ascending=False)
 
             if not nps_am.empty:
                 fig2 = px.bar(
                     nps_am, x="owner_name", y="avg_nps", text="clients",
-                    title="Average NPS per Account Manager",
+                    title=f"Average NPS Q1 '26 per Account Manager",
                     labels={"owner_name": "", "avg_nps": "Avg NPS", "clients": ""},
                     color="avg_nps",
                     color_continuous_scale=[[0, RED], [0.5, ORANGE], [1, GREEN]],
@@ -448,11 +457,11 @@ with tab5:
             )
             if not both.empty and len(both) > 3:
                 fig3 = px.scatter(
-                    both, x="nps", y="trend_pct",
+                    both, x=nps_cur_col, y="trend_pct",
                     size="active_users", color="owner_name",
                     hover_name="name",
-                    title="NPS Score vs User Growth Trend",
-                    labels={"nps": "NPS Score", "trend_pct": "User Trend %", "owner_name": "AM"},
+                    title="NPS Q1 '26 vs User Growth Trend",
+                    labels={nps_cur_col: "NPS Score Q1 '26", "trend_pct": "User Trend %", "owner_name": "AM"},
                 )
                 fig3.add_hline(y=0, line_dash="dash", line_color="grey")
                 fig3.add_vline(x=0, line_dash="dash", line_color="grey")
@@ -460,23 +469,42 @@ with tab5:
                 st.plotly_chart(fig3, use_container_width=True)
                 st.caption("Top right = happy & growing. Bottom left = unhappy & shrinking.")
 
+        # NPS Quarter-over-Quarter per AM
+        if not nps_am.empty and "avg_prev" in nps_am.columns:
+            st.subheader(f"NPS Change: Q1 '26 vs {prev_label} per AM")
+            nps_am_delta = nps_am[nps_am["avg_prev"].notna()].copy()
+            nps_am_delta["delta"] = nps_am_delta["avg_nps"] - nps_am_delta["avg_prev"]
+            nps_am_delta = nps_am_delta.sort_values("delta", ascending=False)
+
+            if not nps_am_delta.empty:
+                fig4 = px.bar(
+                    nps_am_delta, x="owner_name", y="delta",
+                    title=f"NPS Change per AM (Q1 '26 vs {prev_label})",
+                    labels={"owner_name": "", "delta": "NPS Change"},
+                    color="delta",
+                    color_continuous_scale=[[0, RED], [0.5, GREY], [1, GREEN]],
+                )
+                fig4.add_hline(y=0, line_dash="dash", line_color="grey")
+                fig4.update_layout(height=350, xaxis_tickangle=-45, coloraxis_showscale=False)
+                st.plotly_chart(fig4, use_container_width=True)
+
         # Top & Bottom NPS tables
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("Highest NPS")
-            top_nps = nps_clients.nlargest(10, "nps")[["name", "owner_name", "nps", "nps_delta", "nps_responses"]].copy()
-            top_nps.columns = ["Client", "AM", "NPS", "Trend", "Responses"]
+            st.subheader("Highest NPS Q1 '26")
+            top_nps = nps_clients.nlargest(10, nps_cur_col)[["name", "owner_name", nps_cur_col, nps_delta_col, "nps_responses_q1_26"]].copy()
+            top_nps.columns = ["Client", "AM", "NPS", f"vs {prev_label}", "Responses"]
             top_nps["NPS"] = top_nps["NPS"].astype(int)
-            top_nps["Trend"] = top_nps["Trend"].apply(lambda x: f"{x:+.0f}" if pd.notna(x) else "-")
+            top_nps[f"vs {prev_label}"] = top_nps[f"vs {prev_label}"].apply(lambda x: f"{x:+.0f}" if pd.notna(x) else "-")
             st.dataframe(top_nps, hide_index=True, use_container_width=True)
 
         with col2:
-            st.subheader("Lowest NPS — Needs attention")
-            bottom_nps = nps_clients.nsmallest(10, "nps")[["name", "owner_name", "nps", "nps_delta", "nps_responses"]].copy()
-            bottom_nps.columns = ["Client", "AM", "NPS", "Trend", "Responses"]
+            st.subheader("Lowest NPS Q1 '26 — Needs attention")
+            bottom_nps = nps_clients.nsmallest(10, nps_cur_col)[["name", "owner_name", nps_cur_col, nps_delta_col, "nps_responses_q1_26"]].copy()
+            bottom_nps.columns = ["Client", "AM", "NPS", f"vs {prev_label}", "Responses"]
             bottom_nps["NPS"] = bottom_nps["NPS"].astype(int)
-            bottom_nps["Trend"] = bottom_nps["Trend"].apply(lambda x: f"{x:+.0f}" if pd.notna(x) else "-")
+            bottom_nps[f"vs {prev_label}"] = bottom_nps[f"vs {prev_label}"].apply(lambda x: f"{x:+.0f}" if pd.notna(x) else "-")
             st.dataframe(bottom_nps, hide_index=True, use_container_width=True)
 
 
@@ -498,14 +526,14 @@ with tab3:
 
     # Health-based risk scoring
     df["risk_score"] = 0
-    df.loc[df["trend_pct"].fillna(0) < -10, "risk_score"] += 3   # declining users = biggest risk
-    df.loc[df["trend_pct"].fillna(0) < -20, "risk_score"] += 2   # severe decline
-    df.loc[df["nps"].fillna(100) < 0, "risk_score"] += 2         # negative NPS
-    df.loc[df["adoption_pct"].fillna(100) < 30, "risk_score"] += 2  # low adoption
-    df.loc[df["days_no_contact"] > 90, "risk_score"] += 1   # no contact
+    df.loc[df["trend_pct"].fillna(0) < -10, "risk_score"] += 3
+    df.loc[df["trend_pct"].fillna(0) < -20, "risk_score"] += 2
+    df.loc[df[nps_cur_col].fillna(100) < 0, "risk_score"] += 2
+    df.loc[df["adoption_pct"].fillna(100) < 30, "risk_score"] += 2
+    df.loc[df["days_no_contact"] > 90, "risk_score"] += 1
     bill_interval = df["billing_interval_days"].fillna(30)
     overdue = df["days_no_invoice"] - bill_interval
-    df.loc[overdue > 30, "risk_score"] += 1  # invoice overdue (secondary)
+    df.loc[overdue > 30, "risk_score"] += 1
 
     sort_col = st.radio(
         "Sort by",
@@ -532,17 +560,17 @@ with tab3:
 
     # Table
     display = df[["name", "owner_name", "active_users", "paying_users", "trend_pct",
-                   "adoption_pct", "health", "nps", "revenue_12m", "billing_freq",
+                   "adoption_pct", "health", nps_cur_col, "revenue_12m", "billing_freq",
                    "last_contacted", "risk_score"]].copy()
     display.columns = ["Client", "AM", "Active", "Paying", "Trend %",
-                        "Adoption %", "Health", "NPS", "Revenue 12m", "Freq",
+                        "Adoption %", "Health", "NPS Q1", "Revenue 12m", "Freq",
                         "Last Contact", "Risk"]
 
     display["Active"] = display["Active"].fillna(-1).astype(int).astype(str).replace("-1", "-")
     display["Paying"] = display["Paying"].fillna(-1).astype(int).astype(str).replace("-1", "-")
     display["Trend %"] = display["Trend %"].apply(lambda x: f"{x:+.0f}%" if pd.notna(x) else "-")
     display["Adoption %"] = display["Adoption %"].apply(lambda x: f"{x:.0f}%" if pd.notna(x) else "-")
-    display["NPS"] = display["NPS"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
+    display["NPS Q1"] = display["NPS Q1"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
     display["Revenue 12m"] = display["Revenue 12m"].apply(lambda x: f"€{x:,.0f}")
     display["Last Contact"] = display["Last Contact"].dt.strftime("%Y-%m-%d").fillna("-")
     status_emoji = {"growing": "🟢", "stable": "🔵", "declining": "🔴", "inactive": "⚫", "unknown": "⚪"}
@@ -552,7 +580,7 @@ with tab3:
 
 
 # ═══════════════════════════════════════════════════════════════
-# TAB 4: SALES ACTIVITEIT (secundair)
+# TAB 4: SALES ACTIVITY
 # ═══════════════════════════════════════════════════════════════
 with tab4:
     st.header("Sales Activity — Means, not goal")
@@ -563,20 +591,23 @@ with tab4:
     else:
         team_df = eng_df[eng_df["owner_name"].isin(sales_owners)]
 
-        totals = (
-            team_df.groupby("owner_name")[["calls", "meetings", "tasks", "notes"]]
-            .sum().reset_index()
-            .sort_values("calls", ascending=False)
-        )
-        totals["total"] = totals["calls"] + totals["meetings"] + totals["tasks"]
+        # Filter to Q1 2026 only
+        q1_team = team_df[team_df["month"] >= "2026-01-01"]
 
         col1, col2 = st.columns(2)
 
         with col1:
+            q1_totals = (
+                q1_team.groupby("owner_name")[["calls", "meetings", "tasks", "notes"]]
+                .sum().reset_index()
+                .sort_values("calls", ascending=False)
+            )
+            q1_totals["total"] = q1_totals["calls"] + q1_totals["meetings"] + q1_totals["tasks"]
+
             fig = px.bar(
-                totals.melt(id_vars="owner_name", value_vars=["calls", "meetings", "tasks"]),
+                q1_totals.melt(id_vars="owner_name", value_vars=["calls", "meetings", "tasks"]),
                 x="owner_name", y="value", color="variable",
-                title="Activity per AM (calls + meetings + tasks)",
+                title="Activity per AM — Q1 2026",
                 labels={"owner_name": "", "value": "Count", "variable": "Type"},
                 color_discrete_map={"calls": BLUE, "meetings": DARK, "tasks": LIGHT},
             )
@@ -584,7 +615,6 @@ with tab4:
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            # Monthly trend
             monthly = (
                 team_df.groupby(["month", "owner_name"])[["calls", "meetings", "tasks"]]
                 .sum().reset_index()
@@ -602,35 +632,32 @@ with tab4:
         # ─ Effort vs Impact: scatter ─
         if not ec_clients.empty:
             st.subheader("Effort vs Impact — Does activity lead to more happy users?")
-            st.caption("Compare Sales effort in Q1 2026 with user growth in the same period")
+            st.caption(f"Q1 2026 effort vs user growth ({user_trend_col.upper()})")
 
-            # Filter effort to Q1 2026 only
-            q1_effort = team_df[team_df["month"] >= "2026-01-01"]
-            q1_totals = (
-                q1_effort.groupby("owner_name")[["calls", "meetings", "tasks"]]
+            q1_totals_merged = (
+                q1_team.groupby("owner_name")[["calls", "meetings", "tasks"]]
                 .sum().reset_index()
             )
-            q1_totals["effort_q1"] = q1_totals["calls"] + q1_totals["meetings"] + q1_totals["tasks"]
+            q1_totals_merged["effort_q1"] = q1_totals_merged["calls"] + q1_totals_merged["meetings"] + q1_totals_merged["tasks"]
 
-            # YoY user growth per AM (Q1 2026 vs Q1 2025)
-            ec_yoy = ec_clients[ec_clients["yoy_pct"].notna()]
-            if not ec_yoy.empty:
-                am_health = ec_yoy.groupby("owner_name").agg(
-                    yoy_avg=("yoy_pct", "mean"),
+            ec_trend = ec_clients[ec_clients[user_trend_col].notna()]
+            if not ec_trend.empty:
+                am_health = ec_trend.groupby("owner_name").agg(
+                    user_trend=(user_trend_col, "mean"),
                     total_active=("active_users", "sum"),
                     accounts=("id", "count"),
                 ).reset_index()
-                effort_impact = q1_totals.merge(am_health, on="owner_name", how="inner")
+                effort_impact = q1_totals_merged.merge(am_health, on="owner_name", how="inner")
                 effort_impact = effort_impact[effort_impact["owner_name"].isin(sales_owners)]
 
                 if not effort_impact.empty:
                     fig3 = px.scatter(
-                        effort_impact, x="effort_q1", y="yoy_avg",
+                        effort_impact, x="effort_q1", y="user_trend",
                         size="total_active", color="owner_name",
-                        title="Sales effort Q1 2026 (x) vs User growth YoY (y)",
+                        title=f"Sales effort Q1 2026 vs User growth ({user_trend_col.upper()})",
                         labels={
                             "effort_q1": "Activity Q1 2026 (calls+meetings+tasks)",
-                            "yoy_avg": "Avg user growth YoY %",
+                            "user_trend": f"Avg user growth {user_trend_col.upper()} %",
                             "owner_name": "AM",
                         },
                     )
