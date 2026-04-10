@@ -27,6 +27,80 @@ ORANGE = "#E67E22"
 GREY = "#95A5A6"
 
 
+def _dedup_by_debtorid(df):
+    """Aggregate multiple HubSpot entries with the same debtorID into one customer row.
+
+    One customer (debtorID) can have multiple HubSpot company entries for different
+    branches or financial streams. Revenue is summed; EdC/NPS data (already per
+    debtorID) takes the first non-null; dates take the most recent.
+    """
+    if "debtorid" not in df.columns or df["debtorid"].isna().all():
+        return df
+
+    # Separate rows without debtorID — keep as-is
+    no_id = df[df["debtorid"].isna() | (df["debtorid"] == "")].copy()
+    has_id = df[df["debtorid"].notna() & (df["debtorid"] != "")].copy()
+
+    if has_id.empty:
+        return df
+
+    # For each debtorID group, pick the "primary" row (highest revenue) for name/owner
+    has_id["_rev"] = pd.to_numeric(has_id["revenue_12m"], errors="coerce").fillna(0)
+    has_id = has_id.sort_values("_rev", ascending=False)
+
+    # Aggregation rules
+    agg = {
+        "id": "first",                    # keep primary HubSpot id
+        "name": "first",                  # highest-revenue entry name
+        "domain": "first",
+        "owner_id": "first",
+        "owner_name": "first",
+        "lifecycle": "first",
+        "industry": "first",
+        "billing_interval_days": "first",
+        "billing_freq": "first",
+        "product": "first",
+        # Sum financials
+        "revenue_12m": "sum",
+        "invoice_count": "sum",
+        # EdC data — already per debtorID, take first non-null
+        "active_users": "first",
+        "paying_users": "first",
+        "trend_pct": "first",
+        "q1_2026_avg": "first",
+        "q4_2025_avg": "first",
+        "q1_2025_avg": "first",
+        "yoy_pct": "first",
+        "qoq_pct": "first",
+        # NPS — take first non-null
+        "nps_q1_26": "first",
+        "nps_q4_25": "first",
+        "nps_q1_25": "first",
+        "nps_yoy": "first",
+        "nps_qoq": "first",
+        "nps_responses_q1_26": "first",
+        # Dates — most recent
+        "last_contacted": "max",
+        "last_activity": "max",
+        "last_invoice": "max",
+    }
+    # Only aggregate columns that exist
+    agg = {k: v for k, v in agg.items() if k in has_id.columns}
+
+    deduped = has_id.groupby("debtorid", as_index=False).agg(agg)
+
+    # Track how many entries were merged (useful for display)
+    entry_counts = has_id.groupby("debtorid").size().reset_index(name="_entry_count")
+    deduped = deduped.merge(entry_counts, on="debtorid", how="left")
+
+    no_id["_entry_count"] = 1
+    result = pd.concat([deduped, no_id], ignore_index=True)
+    for tmp_col in ["_rev"]:
+        if tmp_col in result.columns:
+            result = result.drop(columns=[tmp_col])
+    return result
+
+
 @st.cache_data(ttl=300)
 def load_data():
     with open(DATA_DIR / "snapshot.json") as f:
@@ -57,6 +131,13 @@ def load_data():
         if col in companies.columns:
             companies[col] = pd.to_numeric(companies[col], errors="coerce")
 
+    # Deduplicate: one customer = one debtorID
+    companies = _dedup_by_debtorid(companies)
+
+    # Recalculate days after dedup (dates were aggregated with max)
+    companies["days_no_invoice"] = (now - companies["last_invoice"]).dt.days
+    companies["days_no_contact"] = (now - companies["last_contacted"]).dt.days
+
     # Health status per account
     companies["health"] = "unknown"
     has_au = companies["active_users"].notna()
@@ -84,17 +165,25 @@ def load_data():
     return companies, owners, eng_df, snap["collected_at"]
 
 
-companies, owners, eng_df, collected_at = load_data()
-
-# Filters
-sales_owners = sorted(companies["owner_name"].dropna().unique())
-sales_owners = [o for o in sales_owners if o not in ("Unknown", "Unassigned", "")]
-ec_clients = companies[companies["active_users"].notna()].copy()
-nps_clients = companies[companies["nps_q1_26"].notna()].copy()
+all_companies, owners, eng_df, collected_at = load_data()
 
 # ─── Sidebar ────────────────────────────────────────────────────
 st.sidebar.title("Sales Dashboard")
 st.sidebar.caption(f"Data: {collected_at[:16]}")
+st.sidebar.markdown("---")
+
+# Product filter
+st.sidebar.markdown("**Product**")
+product_filter = st.sidebar.radio(
+    "Product",
+    ["Ed Controls", "FlexWhere", "All"],
+    label_visibility="collapsed",
+)
+if product_filter == "All":
+    companies = all_companies
+else:
+    companies = all_companies[all_companies["product"] == product_filter].copy()
+
 st.sidebar.markdown("---")
 
 # Global quarter comparison
@@ -110,9 +199,13 @@ is_yoy = "YoY" in compare_mode
 user_prev_col = "q1_2025_avg" if is_yoy else "q4_2025_avg"
 user_trend_col = "yoy_pct" if is_yoy else "qoq_pct"
 nps_cur_col = "nps_q1_26"
-nps_prev_col = "nps_q1_25" if is_yoy else "nps_q4_25"
-nps_delta_col = "nps_yoy" if is_yoy else "nps_qoq"
 prev_label = "Q1 2025" if is_yoy else "Q4 2025"
+
+# Filters
+sales_owners = sorted(companies["owner_name"].dropna().unique())
+sales_owners = [o for o in sales_owners if o not in ("Unknown", "Unassigned", "")]
+ec_clients = companies[companies["active_users"].notna()].copy()
+nps_clients = companies[companies["nps_q1_26"].notna()].copy()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Focus:** Happy Users First")
@@ -121,6 +214,13 @@ st.sidebar.markdown(
     "**Active Users** = Stay Relevant\n\n"
     "**Revenue** = Stay Strong (outcome)"
 )
+st.sidebar.markdown("---")
+if product_filter == "Ed Controls":
+    st.sidebar.caption("NPS target: 50 · Users: A+S roles (RASCI)")
+elif product_filter == "FlexWhere":
+    st.sidebar.caption("NPS target: 32 · All users = paying users")
+else:
+    st.sidebar.caption("EC target NPS 50 · FW target NPS 32")
 
 tab1, tab2, tab5, tab3, tab4 = st.tabs([
     "User Health",
@@ -384,33 +484,28 @@ with tab2:
 # ═══════════════════════════════════════════════════════════════
 with tab5:
     st.header("NPS — Make People Happy")
-    st.caption(f"Net Promoter Score per client · Q1 2026 vs {prev_label}")
+    st.caption("Net Promoter Score per client · Q1 2026 · Source: NPS survey (Ed Controls)")
 
     if nps_clients.empty:
-        st.warning("No NPS data found for Q1 2026. Run collect.py with nps_edc_responses.csv.")
+        st.warning("No NPS data found for Q1 2026.")
     else:
-        # Top metrics
-        avg_nps = nps_clients[nps_cur_col].mean()
+        # Top metrics — response-weighted NPS (not simple average across clients)
         total_responses = int(nps_clients["nps_responses_q1_26"].sum())
+        weights = nps_clients["nps_responses_q1_26"].fillna(1)
+        avg_nps = (nps_clients[nps_cur_col] * weights).sum() / weights.sum()
 
-        # Clients with comparison data
-        has_prev = nps_clients[nps_prev_col].notna()
-        has_delta = nps_clients[nps_delta_col].notna()
-        improving = len(nps_clients[has_delta & (nps_clients[nps_delta_col] > 0)])
-        declining_nps = len(nps_clients[has_delta & (nps_clients[nps_delta_col] < 0)])
-
-        # Previous quarter avg
-        prev_nps = nps_clients.loc[has_prev, nps_prev_col].mean()
-        nps_change = round(avg_nps - prev_nps, 0) if pd.notna(prev_nps) else None
+        # NPS buckets
+        promoters = len(nps_clients[nps_clients[nps_cur_col] > 50])
+        detractors = len(nps_clients[nps_clients[nps_cur_col] < 0])
 
         col1, col2, col3, col4, col5 = st.columns(5)
+        nps_target = 50 if product_filter != "FlexWhere" else 32
         col1.metric("NPS Q1 '26", f"{avg_nps:.0f}",
-                     delta=f"{nps_change:+.0f} vs {prev_label}" if nps_change is not None else None,
-                     delta_color="normal")
+                     help=f"Response-weighted average. Target: {nps_target}")
         col2.metric("Clients with NPS", len(nps_clients))
         col3.metric("Responses Q1 '26", f"{total_responses:,}")
-        col4.metric("NPS improving", improving, delta=f"{improving} clients", delta_color="normal")
-        col5.metric("NPS declining", declining_nps, delta=f"-{declining_nps} clients", delta_color="inverse")
+        col4.metric("Promoters (NPS > 50)", promoters, delta=f"{promoters} clients", delta_color="normal")
+        col5.metric("Detractors (NPS < 0)", detractors, delta=f"-{detractors} clients", delta_color="inverse")
 
         st.markdown("---")
 
@@ -424,17 +519,26 @@ with tab5:
                 color_discrete_sequence=[BLUE],
             )
             fig.add_vline(x=0, line_dash="dash", line_color="grey", annotation_text="Neutral")
-            fig.add_vline(x=50, line_dash="dash", line_color=GREEN, annotation_text="Excellent")
+            nps_target = 50 if product_filter != "FlexWhere" else 32
+            fig.add_vline(x=nps_target, line_dash="dash", line_color=GREEN,
+                          annotation_text=f"Target: {nps_target}")
             fig.update_layout(height=400)
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            nps_am = nps_clients[nps_clients["owner_name"].isin(sales_owners)].groupby("owner_name").agg(
-                avg_nps=(nps_cur_col, "mean"),
-                avg_prev=(nps_prev_col, "mean"),
+            # Response-weighted NPS per AM
+            am_nps_data = nps_clients[nps_clients["owner_name"].isin(sales_owners)].copy()
+            am_nps_data["_w"] = am_nps_data["nps_responses_q1_26"].fillna(1)
+            am_nps_data["_wnps"] = am_nps_data[nps_cur_col] * am_nps_data["_w"]
+            nps_am = am_nps_data.groupby("owner_name").agg(
+                _wnps_sum=("_wnps", "sum"),
+                _w_sum=("_w", "sum"),
                 clients=("id", "count"),
                 responses=("nps_responses_q1_26", "sum"),
-            ).reset_index().sort_values("avg_nps", ascending=False)
+            ).reset_index()
+            nps_am["avg_nps"] = nps_am["_wnps_sum"] / nps_am["_w_sum"]
+            nps_am = nps_am.drop(columns=["_wnps_sum", "_w_sum"])
+            nps_am = nps_am.sort_values("avg_nps", ascending=False)
 
             if not nps_am.empty:
                 fig2 = px.bar(
@@ -469,42 +573,21 @@ with tab5:
                 st.plotly_chart(fig3, use_container_width=True)
                 st.caption("Top right = happy & growing. Bottom left = unhappy & shrinking.")
 
-        # NPS Quarter-over-Quarter per AM
-        if not nps_am.empty and "avg_prev" in nps_am.columns:
-            st.subheader(f"NPS Change: Q1 '26 vs {prev_label} per AM")
-            nps_am_delta = nps_am[nps_am["avg_prev"].notna()].copy()
-            nps_am_delta["delta"] = nps_am_delta["avg_nps"] - nps_am_delta["avg_prev"]
-            nps_am_delta = nps_am_delta.sort_values("delta", ascending=False)
-
-            if not nps_am_delta.empty:
-                fig4 = px.bar(
-                    nps_am_delta, x="owner_name", y="delta",
-                    title=f"NPS Change per AM (Q1 '26 vs {prev_label})",
-                    labels={"owner_name": "", "delta": "NPS Change"},
-                    color="delta",
-                    color_continuous_scale=[[0, RED], [0.5, GREY], [1, GREEN]],
-                )
-                fig4.add_hline(y=0, line_dash="dash", line_color="grey")
-                fig4.update_layout(height=350, xaxis_tickangle=-45, coloraxis_showscale=False)
-                st.plotly_chart(fig4, use_container_width=True)
-
         # Top & Bottom NPS tables
         col1, col2 = st.columns(2)
 
         with col1:
             st.subheader("Highest NPS Q1 '26")
-            top_nps = nps_clients.nlargest(10, nps_cur_col)[["name", "owner_name", nps_cur_col, nps_delta_col, "nps_responses_q1_26"]].copy()
-            top_nps.columns = ["Client", "AM", "NPS", f"vs {prev_label}", "Responses"]
+            top_nps = nps_clients.nlargest(10, nps_cur_col)[["name", "owner_name", nps_cur_col, "nps_responses_q1_26"]].copy()
+            top_nps.columns = ["Client", "AM", "NPS", "Responses"]
             top_nps["NPS"] = top_nps["NPS"].astype(int)
-            top_nps[f"vs {prev_label}"] = top_nps[f"vs {prev_label}"].apply(lambda x: f"{x:+.0f}" if pd.notna(x) else "-")
             st.dataframe(top_nps, hide_index=True, use_container_width=True)
 
         with col2:
             st.subheader("Lowest NPS Q1 '26 — Needs attention")
-            bottom_nps = nps_clients.nsmallest(10, nps_cur_col)[["name", "owner_name", nps_cur_col, nps_delta_col, "nps_responses_q1_26"]].copy()
-            bottom_nps.columns = ["Client", "AM", "NPS", f"vs {prev_label}", "Responses"]
+            bottom_nps = nps_clients.nsmallest(10, nps_cur_col)[["name", "owner_name", nps_cur_col, "nps_responses_q1_26"]].copy()
+            bottom_nps.columns = ["Client", "AM", "NPS", "Responses"]
             bottom_nps["NPS"] = bottom_nps["NPS"].astype(int)
-            bottom_nps[f"vs {prev_label}"] = bottom_nps[f"vs {prev_label}"].apply(lambda x: f"{x:+.0f}" if pd.notna(x) else "-")
             st.dataframe(bottom_nps, hide_index=True, use_container_width=True)
 
 
@@ -551,7 +634,7 @@ with tab3:
 
     # Metrics
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Clients", len(df))
+    col1.metric("Customers", len(df))
     has_au = df["active_users"].notna()
     col2.metric("With EdC data", int(has_au.sum()))
     col3.metric("Active Users", f"{df['active_users'].sum():,.0f}" if has_au.any() else "-")
