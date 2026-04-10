@@ -162,10 +162,13 @@ def load_data():
         eng_df["month"] = pd.to_datetime(eng_df["month"] + "-01")
         eng_df["total"] = eng_df["calls"] + eng_df["meetings"] + eng_df["tasks"]
 
-    return companies, owners, eng_df, snap["collected_at"]
+    # Global EdC active-user totals (unique users, no double-counting across clients)
+    edc_global = snap.get("edc_global_active_users", {})
+
+    return companies, owners, eng_df, snap["collected_at"], edc_global
 
 
-all_companies, owners, eng_df, collected_at = load_data()
+all_companies, owners, eng_df, collected_at, edc_global = load_data()
 
 # ─── Sidebar ────────────────────────────────────────────────────
 st.sidebar.title("Sales Dashboard")
@@ -222,8 +225,9 @@ elif product_filter == "FlexWhere":
 else:
     st.sidebar.caption("EC target NPS 50 · FW target NPS 32")
 
-tab1, tab2, tab5, tab3, tab4 = st.tabs([
+tab1, tab6, tab2, tab5, tab3, tab4 = st.tabs([
     "User Health",
+    "My Portfolio",
     "Adoption Alert",
     "NPS",
     "Account Details",
@@ -245,16 +249,30 @@ with tab1:
         ec_with_trend = ec_clients[has_trend].copy()
 
         # ─ Top-level metrics ─
-        total_active = int(ec_clients["active_users"].sum())
-        total_prev = int(ec_with_trend[user_prev_col].sum()) if not ec_with_trend.empty else 0
-        total_cur = int(ec_with_trend["q1_2026_avg"].sum()) if not ec_with_trend.empty else 0
+        # Use global EdC totals (unique users) when showing Ed Controls;
+        # per-client sums overcount due to users active in multiple orgs.
+        if product_filter == "Ed Controls" and edc_global:
+            q1_months = [edc_global.get(k, 0) for k in ["2026-01", "2026-02", "2026-03"]]
+            total_active = int(round(sum(q1_months) / len(q1_months))) if q1_months else 0
+            if compare_mode == "Q4 2025":
+                prev_months = [edc_global.get(k, 0) for k in ["2025-10", "2025-11", "2025-12"]]
+            else:
+                prev_months = [edc_global.get(k, 0) for k in ["2025-01", "2025-02", "2025-03"]]
+            total_prev = int(round(sum(prev_months) / len(prev_months))) if prev_months else 0
+            total_cur = total_active
+        else:
+            total_active = int(ec_clients["active_users"].sum())
+            total_prev = int(ec_with_trend[user_prev_col].sum()) if not ec_with_trend.empty else 0
+            total_cur = int(ec_with_trend["q1_2026_avg"].sum()) if not ec_with_trend.empty else 0
         pct_change = round((total_cur - total_prev) / total_prev * 100, 1) if total_prev > 0 else 0
         growing = len(ec_with_trend[ec_with_trend[user_trend_col] > 5])
         declining = len(ec_with_trend[ec_with_trend[user_trend_col] < -5])
         avg_adoption = ec_clients["adoption_pct"].mean()
 
         col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Active Users (Q1 '26)", f"{total_active:,}")
+        au_label = "Active Users (Q1 '26)" if product_filter != "Ed Controls" else "Active Users (Q1 '26 avg)"
+        col1.metric(au_label, f"{total_active:,}",
+                    help="Global unique users (EdC API)" if product_filter == "Ed Controls" else None)
         col2.metric(f"vs {prev_label}", f"{pct_change:+.1f}%",
                     delta=f"{total_cur - total_prev:+,} users", delta_color="normal")
         col3.metric("Growing", growing, delta=f"{growing} accounts", delta_color="normal")
@@ -371,6 +389,227 @@ with tab1:
         disp["Users Q1 '26"] = disp["Users Q1 '26"].astype(int)
         disp[f"Users {prev_label}"] = disp[f"Users {prev_label}"].astype(int)
         st.dataframe(disp, hide_index=True, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 6: MY PORTFOLIO — Prioritized action list per AM
+# ═══════════════════════════════════════════════════════════════
+with tab6:
+    st.header("My Portfolio — Where to spend your time")
+    st.caption("Prioritized action list per account manager. Sorted by impact.")
+
+    selected_am_port = st.selectbox(
+        "Select Account Manager", sales_owners, key="portfolio_am"
+    )
+
+    # Filter to this AM's clients with EdC data
+    my = companies[
+        (companies["owner_name"] == selected_am_port) &
+        (companies["active_users"].notna())
+    ].copy()
+
+    if my.empty:
+        st.info("No clients with active user data for this AM.")
+    else:
+        # ── Impact weight: active_users as proxy for customer size ──
+        my["_revenue"] = pd.to_numeric(my["revenue_12m"], errors="coerce").fillna(0)
+        max_users = my["active_users"].max() or 1
+        max_rev = my["_revenue"].max() or 1
+
+        # ── Classify each account into an action bucket ──
+        # Priority 1: PROTECT — declining users or low NPS on sizeable accounts
+        # Priority 2: GROW — happy clients with expansion potential
+        # Priority 3: NURTURE — healthy accounts, keep relationship warm
+        def classify(row):
+            trend = row.get("trend_pct") or 0
+            nps = row.get("nps_q1_26")
+            au = row.get("active_users") or 0
+            days_nc = row.get("days_no_contact") or 0
+            nps_val = nps if pd.notna(nps) else None
+
+            # PROTECT: declining or unhappy
+            if trend < -10 or (nps_val is not None and nps_val < 0):
+                return "Protect"
+            if trend < -5 and au > 20:
+                return "Protect"
+            if days_nc > 90 and au > 20:
+                return "Protect"
+
+            # GROW: stable/growing with positive signals
+            if nps_val is not None and nps_val >= 50 and trend >= 0:
+                return "Grow"
+            if trend > 10 and au > 10:
+                return "Grow"
+
+            return "Nurture"
+
+        my["action"] = my.apply(classify, axis=1)
+
+        # ── Impact score: size × urgency ──
+        def impact_score(row):
+            size = (row["active_users"] / max_users) * 0.4 + (row["_revenue"] / max_rev) * 0.4
+            urgency = 0
+            trend = row.get("trend_pct") or 0
+            nps_val = row.get("nps_q1_26")
+            days_nc = row.get("days_no_contact") or 0
+
+            if trend < -10:
+                urgency += 0.3
+            elif trend < -5:
+                urgency += 0.15
+            if pd.notna(nps_val) and nps_val < 0:
+                urgency += 0.3
+            elif pd.notna(nps_val) and nps_val < 30:
+                urgency += 0.15
+            if days_nc > 90:
+                urgency += 0.2
+            return round((size + urgency) * 100, 1)
+
+        my["impact"] = my.apply(impact_score, axis=1)
+
+        # ── Suggested action text ──
+        def suggest_action(row):
+            reasons = []
+            trend = row.get("trend_pct") or 0
+            nps_val = row.get("nps_q1_26")
+            days_nc = row.get("days_no_contact") or 0
+            au = int(row.get("active_users") or 0)
+            paying = int(row.get("paying_users") or 0)
+
+            if row["action"] == "Protect":
+                if trend < -10:
+                    reasons.append(f"Users declining {trend:+.0f}%")
+                if pd.notna(nps_val) and nps_val < 0:
+                    reasons.append(f"NPS {nps_val:.0f} — unhappy")
+                elif pd.notna(nps_val) and nps_val < 30:
+                    reasons.append(f"NPS {nps_val:.0f} — at risk")
+                if days_nc > 90:
+                    reasons.append(f"No contact {days_nc:.0f}d")
+                if not reasons:
+                    reasons.append(f"Users declining {trend:+.0f}%")
+                return "Schedule review call. " + "; ".join(reasons)
+
+            if row["action"] == "Grow":
+                if pd.notna(nps_val) and nps_val >= 50:
+                    reasons.append(f"NPS {nps_val:.0f} — promoter")
+                if trend > 10:
+                    reasons.append(f"Growing {trend:+.0f}%")
+                if paying > 0 and au > paying * 2:
+                    reasons.append(f"{au} active vs {paying} paying")
+                return "Explore expansion. " + "; ".join(reasons) if reasons else "Explore expansion"
+
+            # Nurture
+            if days_nc > 60:
+                return f"Check in — no contact {days_nc:.0f}d"
+            return "On track — maintain relationship"
+
+        my["suggested_action"] = my.apply(suggest_action, axis=1)
+
+        # ── Summary metrics ──
+        protect = my[my["action"] == "Protect"]
+        grow = my[my["action"] == "Grow"]
+        nurture = my[my["action"] == "Nurture"]
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total clients", len(my))
+        col2.metric("Protect", len(protect), delta=f"-{len(protect)}" if len(protect) > 0 else "0",
+                     delta_color="inverse",
+                     help="Declining, unhappy, or neglected — act now")
+        col3.metric("Grow", len(grow), delta=f"+{len(grow)}" if len(grow) > 0 else "0",
+                     delta_color="normal",
+                     help="Happy & healthy — explore expansion")
+        col4.metric("Nurture", len(nurture),
+                     help="On track — keep relationship warm")
+
+        st.markdown("---")
+
+        # ── PROTECT section ──
+        if not protect.empty:
+            st.subheader("Protect — Act now to prevent churn")
+            prot_sorted = protect.sort_values("impact", ascending=False)
+            disp = prot_sorted[["name", "active_users", "paying_users", "trend_pct",
+                                 "nps_q1_26", "revenue_12m", "days_no_contact",
+                                 "suggested_action", "impact"]].copy()
+            disp.columns = ["Client", "Active", "Paying", "Trend %", "NPS",
+                            "Revenue 12m", "Days No Contact", "Suggested Action", "Impact"]
+            disp["Active"] = disp["Active"].astype(int)
+            disp["Paying"] = disp["Paying"].fillna(0).astype(int)
+            disp["Trend %"] = disp["Trend %"].apply(lambda x: f"{x:+.0f}%" if pd.notna(x) else "-")
+            disp["NPS"] = disp["NPS"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
+            disp["Revenue 12m"] = disp["Revenue 12m"].apply(lambda x: f"\u20ac{x:,.0f}")
+            disp["Days No Contact"] = disp["Days No Contact"].fillna(0).astype(int)
+            st.dataframe(disp, hide_index=True, use_container_width=True,
+                         column_config={"Impact": st.column_config.ProgressColumn(
+                             min_value=0, max_value=100, format="%.0f")})
+
+        # ── GROW section ──
+        if not grow.empty:
+            st.subheader("Grow — Happy clients with expansion potential")
+            grow_sorted = grow.sort_values("impact", ascending=False)
+            disp = grow_sorted[["name", "active_users", "paying_users", "trend_pct",
+                                 "nps_q1_26", "revenue_12m",
+                                 "suggested_action", "impact"]].copy()
+            disp.columns = ["Client", "Active", "Paying", "Trend %", "NPS",
+                            "Revenue 12m", "Suggested Action", "Impact"]
+            disp["Active"] = disp["Active"].astype(int)
+            disp["Paying"] = disp["Paying"].fillna(0).astype(int)
+            disp["Trend %"] = disp["Trend %"].apply(lambda x: f"{x:+.0f}%" if pd.notna(x) else "-")
+            disp["NPS"] = disp["NPS"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
+            disp["Revenue 12m"] = disp["Revenue 12m"].apply(lambda x: f"\u20ac{x:,.0f}")
+            st.dataframe(disp, hide_index=True, use_container_width=True,
+                         column_config={"Impact": st.column_config.ProgressColumn(
+                             min_value=0, max_value=100, format="%.0f")})
+
+        # ── NURTURE section ──
+        if not nurture.empty:
+            st.subheader("Nurture — On track, stay connected")
+            nurt_sorted = nurture.sort_values("impact", ascending=False)
+            disp = nurt_sorted[["name", "active_users", "trend_pct",
+                                 "nps_q1_26", "revenue_12m", "days_no_contact",
+                                 "suggested_action"]].copy()
+            disp.columns = ["Client", "Active", "Trend %", "NPS",
+                            "Revenue 12m", "Days No Contact", "Suggested Action"]
+            disp["Active"] = disp["Active"].astype(int)
+            disp["Trend %"] = disp["Trend %"].apply(lambda x: f"{x:+.0f}%" if pd.notna(x) else "-")
+            disp["NPS"] = disp["NPS"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
+            disp["Revenue 12m"] = disp["Revenue 12m"].apply(lambda x: f"\u20ac{x:,.0f}")
+            disp["Days No Contact"] = disp["Days No Contact"].fillna(0).astype(int)
+            st.dataframe(disp, hide_index=True, use_container_width=True)
+
+        # ── Portfolio health chart ──
+        st.markdown("---")
+        st.subheader("Portfolio Overview")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            action_counts = my["action"].value_counts().reset_index()
+            action_counts.columns = ["Action", "Count"]
+            color_map = {"Protect": RED, "Grow": GREEN, "Nurture": BLUE}
+            fig = px.pie(action_counts, names="Action", values="Count",
+                         title="Client split by action type",
+                         color="Action", color_discrete_map=color_map)
+            fig.update_layout(height=350)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            # Scatter: NPS vs trend, colored by action, sized by revenue
+            scatter_data = my[my["nps_q1_26"].notna() & my["trend_pct"].notna()].copy()
+            if len(scatter_data) > 3:
+                fig2 = px.scatter(
+                    scatter_data, x="nps_q1_26", y="trend_pct",
+                    size="active_users", color="action",
+                    hover_name="name",
+                    title="NPS vs User Trend (size = active users)",
+                    labels={"nps_q1_26": "NPS Q1 '26", "trend_pct": "User Trend %", "action": "Action"},
+                    color_discrete_map=color_map,
+                )
+                fig2.add_hline(y=0, line_dash="dash", line_color="grey")
+                fig2.add_vline(x=0, line_dash="dash", line_color="grey")
+                fig2.update_layout(height=350)
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Not enough data for scatter plot (need NPS + trend for 3+ clients)")
 
 
 # ═══════════════════════════════════════════════════════════════
