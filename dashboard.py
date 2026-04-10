@@ -60,9 +60,9 @@ def _dedup_by_debtorid(df):
         "billing_interval_days": "first",
         "billing_freq": "first",
         "product": "first",
-        # Sum financials
-        "revenue_12m": "sum",
-        "invoice_count": "sum",
+        # Financials — already per debtorID from MoneyBird, take first
+        "revenue_12m": "first",
+        "invoice_count": "first",
         # EdC data — already per debtorID, take first non-null
         "active_users": "first",
         "paying_users": "first",
