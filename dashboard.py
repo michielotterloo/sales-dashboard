@@ -259,7 +259,12 @@ with tab1:
                     delta=f"{total_cur - total_prev:+,} users", delta_color="normal")
         col3.metric("Growing", growing, delta=f"{growing} accounts", delta_color="normal")
         col4.metric("Declining", declining, delta=f"-{declining} accounts", delta_color="inverse")
-        col5.metric("Adoption", f"{avg_adoption:.0f}%", help="Paying / Active users ratio")
+        if product_filter != "Ed Controls":
+            col5.metric("Adoption", f"{avg_adoption:.0f}%", help="Paying / Active users ratio")
+        else:
+            total_paying = int(ec_clients["paying_users"].sum())
+            col5.metric("Paying Users", f"{total_paying:,}",
+                        help="A+S roles (RASCI). Other roles (R,C,I) are active but non-paying.")
 
         st.markdown("---")
 
@@ -289,12 +294,14 @@ with tab1:
             ).reset_index()
             au_am = au_am[au_am["owner_name"].isin(sales_owners)].sort_values("active", ascending=False)
 
+            pay_label = "paying (A+S)" if product_filter == "Ed Controls" else "paying"
+            au_am = au_am.rename(columns={"paying": pay_label})
             fig2 = px.bar(
-                au_am, x="owner_name", y=["active", "paying"],
+                au_am, x="owner_name", y=["active", pay_label],
                 title="Active & Paying Users per AM",
                 labels={"owner_name": "", "value": "Users", "variable": ""},
                 barmode="overlay",
-                color_discrete_map={"active": LIGHT, "paying": DARK},
+                color_discrete_map={"active": LIGHT, pay_label: DARK},
             )
             fig2.update_layout(height=400, xaxis_tickangle=-45)
             st.plotly_chart(fig2, use_container_width=True)
@@ -423,33 +430,59 @@ with tab2:
                 st.success("No accounts with declining users!")
 
         with alert_tab2:
-            st.subheader("Low adoption — licenses underutilized")
-            st.caption("Accounts where paying/active user ratio is low. Opportunity for training or onboarding.")
+            if product_filter == "Ed Controls":
+                st.subheader("Paying vs Active Users (RASCI)")
+                st.caption(
+                    "In Ed Controls, only A (Accountable) and S (Support) roles are paying. "
+                    "R, C, and I roles are active but non-paying by design. "
+                    "A low ratio is normal — it reflects the RASCI model, not underutilization."
+                )
+                has_both = ec_clients[
+                    (ec_clients["active_users"] > 5) &
+                    (ec_clients["paying_users"].notna())
+                ].sort_values("adoption_pct")
+                if not has_both.empty:
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Accounts", len(has_both))
+                    col2.metric("Total Active", int(has_both["active_users"].sum()))
+                    col3.metric("Total Paying (A+S)", int(has_both["paying_users"].sum()))
 
-            adoption_threshold = st.slider("Maximum adoption %", 10, 80, 40, step=5, key="adoption")
-
-            low_adoption = ec_clients[
-                (ec_clients["adoption_pct"].notna()) &
-                (ec_clients["adoption_pct"] < adoption_threshold) &
-                (ec_clients["active_users"] > 5)
-            ].sort_values("adoption_pct")
-
-            if not low_adoption.empty:
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Accounts", len(low_adoption))
-                col2.metric("Unused licenses", int(low_adoption["active_users"].sum() - low_adoption["paying_users"].sum()))
-                col3.metric("Avg adoption", f"{low_adoption['adoption_pct'].mean():.0f}%")
-
-                detail = low_adoption[["name", "owner_name", "active_users", "paying_users",
-                                        "adoption_pct", "trend_pct"]].copy()
-                detail.columns = ["Client", "AM", "Active", "Paying", "Adoption %", "Trend %"]
-                detail["Active"] = detail["Active"].astype(int)
-                detail["Paying"] = detail["Paying"].astype(int)
-                detail["Adoption %"] = detail["Adoption %"].apply(lambda x: f"{x:.0f}%")
-                detail["Trend %"] = detail["Trend %"].apply(lambda x: f"{x:+.0f}%" if pd.notna(x) else "-")
-                st.dataframe(detail, hide_index=True, use_container_width=True, height=400)
+                    detail = has_both[["name", "owner_name", "active_users", "paying_users",
+                                       "adoption_pct", "trend_pct"]].copy()
+                    detail.columns = ["Client", "AM", "Active (all roles)", "Paying (A+S)", "A+S %", "Trend %"]
+                    detail["Active (all roles)"] = detail["Active (all roles)"].astype(int)
+                    detail["Paying (A+S)"] = detail["Paying (A+S)"].astype(int)
+                    detail["A+S %"] = detail["A+S %"].apply(lambda x: f"{x:.0f}%" if pd.notna(x) else "-")
+                    detail["Trend %"] = detail["Trend %"].apply(lambda x: f"{x:+.0f}%" if pd.notna(x) else "-")
+                    st.dataframe(detail, hide_index=True, use_container_width=True, height=400)
             else:
-                st.success(f"All accounts above {adoption_threshold}% adoption!")
+                st.subheader("Low adoption — licenses underutilized")
+                st.caption("Accounts where paying/active user ratio is low.")
+
+                adoption_threshold = st.slider("Maximum adoption %", 10, 80, 40, step=5, key="adoption")
+
+                low_adoption = ec_clients[
+                    (ec_clients["adoption_pct"].notna()) &
+                    (ec_clients["adoption_pct"] < adoption_threshold) &
+                    (ec_clients["active_users"] > 5)
+                ].sort_values("adoption_pct")
+
+                if not low_adoption.empty:
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Accounts", len(low_adoption))
+                    col2.metric("Unused licenses", int(low_adoption["active_users"].sum() - low_adoption["paying_users"].sum()))
+                    col3.metric("Avg adoption", f"{low_adoption['adoption_pct'].mean():.0f}%")
+
+                    detail = low_adoption[["name", "owner_name", "active_users", "paying_users",
+                                            "adoption_pct", "trend_pct"]].copy()
+                    detail.columns = ["Client", "AM", "Active", "Paying", "Adoption %", "Trend %"]
+                    detail["Active"] = detail["Active"].astype(int)
+                    detail["Paying"] = detail["Paying"].astype(int)
+                    detail["Adoption %"] = detail["Adoption %"].apply(lambda x: f"{x:.0f}%")
+                    detail["Trend %"] = detail["Trend %"].apply(lambda x: f"{x:+.0f}%" if pd.notna(x) else "-")
+                    st.dataframe(detail, hide_index=True, use_container_width=True, height=400)
+                else:
+                    st.success(f"All accounts above {adoption_threshold}% adoption!")
 
         with alert_tab3:
             st.subheader("Active clients without recent contact")
@@ -612,7 +645,8 @@ with tab3:
     df.loc[df["trend_pct"].fillna(0) < -10, "risk_score"] += 3
     df.loc[df["trend_pct"].fillna(0) < -20, "risk_score"] += 2
     df.loc[df[nps_cur_col].fillna(100) < 0, "risk_score"] += 2
-    df.loc[df["adoption_pct"].fillna(100) < 30, "risk_score"] += 2
+    if product_filter != "Ed Controls":
+        df.loc[df["adoption_pct"].fillna(100) < 30, "risk_score"] += 2
     df.loc[df["days_no_contact"] > 90, "risk_score"] += 1
     bill_interval = df["billing_interval_days"].fillna(30)
     overdue = df["days_no_invoice"] - bill_interval
@@ -645,14 +679,16 @@ with tab3:
     display = df[["name", "owner_name", "active_users", "paying_users", "trend_pct",
                    "adoption_pct", "health", nps_cur_col, "revenue_12m", "billing_freq",
                    "last_contacted", "risk_score"]].copy()
-    display.columns = ["Client", "AM", "Active", "Paying", "Trend %",
-                        "Adoption %", "Health", "NPS Q1", "Revenue 12m", "Freq",
+    adopt_label = "A+S %" if product_filter == "Ed Controls" else "Adoption %"
+    pay_label = "Paying (A+S)" if product_filter == "Ed Controls" else "Paying"
+    display.columns = ["Client", "AM", "Active", pay_label, "Trend %",
+                        adopt_label, "Health", "NPS Q1", "Revenue 12m", "Freq",
                         "Last Contact", "Risk"]
 
     display["Active"] = display["Active"].fillna(-1).astype(int).astype(str).replace("-1", "-")
-    display["Paying"] = display["Paying"].fillna(-1).astype(int).astype(str).replace("-1", "-")
+    display[pay_label] = display[pay_label].fillna(-1).astype(int).astype(str).replace("-1", "-")
     display["Trend %"] = display["Trend %"].apply(lambda x: f"{x:+.0f}%" if pd.notna(x) else "-")
-    display["Adoption %"] = display["Adoption %"].apply(lambda x: f"{x:.0f}%" if pd.notna(x) else "-")
+    display[adopt_label] = display[adopt_label].apply(lambda x: f"{x:.0f}%" if pd.notna(x) else "-")
     display["NPS Q1"] = display["NPS Q1"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
     display["Revenue 12m"] = display["Revenue 12m"].apply(lambda x: f"€{x:,.0f}")
     display["Last Contact"] = display["Last Contact"].dt.strftime("%Y-%m-%d").fillna("-")
